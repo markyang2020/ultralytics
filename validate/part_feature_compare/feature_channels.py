@@ -85,13 +85,20 @@ def extract_foreground_mask(image: Image.Image) -> tuple[np.ndarray, str | None]
         cv2.BORDER_CONSTANT,
         value=(255, 255, 255),
     )
-    mask = np.zeros(padded.shape[:2], dtype=np.uint8)
-    inset = max(1, padding // 2)
-    rect = (inset, inset, padded.shape[1] - 2 * inset, padded.shape[0] - 2 * inset)
+    mask = np.full(padded.shape[:2], cv2.GC_BGD, dtype=np.uint8)
+    original_y = slice(padding, padding + height)
+    original_x = slice(padding, padding + width)
+    mask[original_y, original_x] = cv2.GC_PR_BGD
+    center_margin_x = max(1, round(width * 0.25))
+    center_margin_y = max(1, round(height * 0.25))
+    mask[
+        padding + center_margin_y : padding + height - center_margin_y,
+        padding + center_margin_x : padding + width - center_margin_x,
+    ] = cv2.GC_PR_FGD
     background_model = np.zeros((1, 65), dtype=np.float64)
     foreground_model = np.zeros((1, 65), dtype=np.float64)
     try:
-        cv2.grabCut(padded, mask, rect, background_model, foreground_model, 5, cv2.GC_INIT_WITH_RECT)
+        cv2.grabCut(padded, mask, None, background_model, foreground_model, 5, cv2.GC_INIT_WITH_MASK)
     except cv2.error:
         return np.full((height, width), 255, dtype=np.uint8), "foreground_mask_failed"
 
@@ -103,6 +110,8 @@ def extract_foreground_mask(image: Image.Image) -> tuple[np.ndarray, str | None]
     foreground = foreground[padding : padding + height, padding : padding + width]
     if not np.any(foreground):
         return np.full((height, width), 255, dtype=np.uint8), "foreground_mask_empty"
+    if np.count_nonzero(foreground) / foreground.size > 0.98:
+        return np.full((height, width), 255, dtype=np.uint8), "foreground_mask_full"
     return foreground, None
 
 

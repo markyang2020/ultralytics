@@ -15,6 +15,7 @@ from feature_channels import (
     DinoV2FeatureExtractor,
     compute_channel_scores,
     cosine_feature_similarity,
+    extract_foreground_mask,
     extract_shape_feature,
     letterbox_square,
     preprocess_crop,
@@ -56,6 +57,19 @@ def test_preprocess_crop_records_fallback_for_empty_foreground():
     assert result.foreground_fallback == "foreground_mask_empty"
     assert result.mask[128, 128] == 255
     assert result.mask[0, 0] == 0
+
+
+def test_foreground_mask_excludes_different_crop_border_background():
+    """防止GrabCut把检测框中的现场背景整体当成部件前景。"""
+    image = Image.new("RGB", (80, 80), "blue")
+    ImageDraw.Draw(image).rectangle((20, 20, 60, 60), fill="red")
+
+    mask, fallback = extract_foreground_mask(image)
+
+    assert fallback is None
+    assert mask[40, 40] == 255
+    assert mask[2, 2] == 0
+    assert 0.2 < np.count_nonzero(mask) / mask.size < 0.4
 
 
 class _FakeDinoModel(torch.nn.Module):

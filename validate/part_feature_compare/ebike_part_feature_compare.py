@@ -14,8 +14,6 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence, Tuple
 
 import torch
-from PIL import Image, ImageDraw, ImageFont, ImageOps
-
 from feature_channels import (
     ChannelScores,
     DinoV2FeatureExtractor,
@@ -23,6 +21,7 @@ from feature_channels import (
     compute_channel_scores,
     cosine_feature_similarity,
 )
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 Box = Tuple[float, float, float, float]
 ClippedBox = Tuple[int, int, int, int]
@@ -506,7 +505,7 @@ def save_visualizations(
     summary.paste(_fit_panel(actual_annotated, (790, 650)), (820, 60))
     summary_draw = ImageDraw.Draw(summary)
     summary_draw.text((20, 15), "Reference 3C", fill="black", font=font)
-    summary_draw.text((830, 15), "Actual left-front 45", fill="black", font=font)
+    summary_draw.text((830, 15), "Actual inspection", fill="black", font=font)
     summary_path = output_dir / "comparison_summary.jpg"
     summary.save(summary_path, quality=95)
     return {
