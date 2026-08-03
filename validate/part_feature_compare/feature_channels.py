@@ -31,7 +31,39 @@ class ExtractedFeatureBatch:
 
     baseline: torch.Tensor
     gray_dino: torch.Tensor
+    shape: torch.Tensor
+    shape_available: tuple[bool, ...]
     preprocessed: tuple[PreprocessedCrop, ...]
+
+
+@dataclass(frozen=True)
+class ChannelScores:
+    """保存基线和实验通道的独立分数及本次实际融合权重。"""
+
+    baseline_similarity: float
+    gray_dino_similarity: float
+    shape_similarity: float | None
+    fused_similarity: float
+    channel_gap: float | None
+    dino_weight: float
+    shape_weight: float
+    shape_available: bool
+
+
+CHANNEL_WEIGHTS = {
+    "saddle": (0.35, 0.65),
+    "seat": (0.35, 0.65),
+    "backrest": (0.40, 0.60),
+    "front_basket": (0.45, 0.55),
+    "ebike_full": (0.60, 0.40),
+    "front_wheel": (0.30, 0.70),
+    "rear_wheel": (0.30, 0.70),
+}
+
+SHAPE_FEATURE_DIMENSION = 2020
+HOG_ORIENTATIONS = 9
+HOG_CELL_SIZE = 32
+HOG_BLOCK_CELLS = 2
 
 
 def extract_foreground_mask(image: Image.Image) -> tuple[np.ndarray, str | None]:
@@ -123,6 +155,121 @@ def preprocess_crop(image: Image.Image) -> PreprocessedCrop:
     )
 
 
+def _compute_hog(gray: np.ndarray) -> np.ndarray:
+    """使用现有 OpenCV 梯度算子计算 9 方向、2 x 2 block 的 L2-Hys HOG。"""
+    image = gray.astype(np.float32) / 255.0
+    gradient_x = cv2.Sobel(image, cv2.CV_32F, 1, 0, ksize=1)
+    gradient_y = cv2.Sobel(image, cv2.CV_32F, 0, 1, ksize=1)
+    magnitude, angle = cv2.cartToPolar(gradient_x, gradient_y, angleInDegrees=True)
+    angle = np.mod(angle, 180.0)
+
+    cell_count = gray.shape[0] // HOG_CELL_SIZE
+    histograms = np.zeros((cell_count, cell_count, HOG_ORIENTATIONS), dtype=np.float32)
+    bin_position = angle / (180.0 / HOG_ORIENTATIONS)
+    lower_bin = np.floor(bin_position).astype(np.int32) % HOG_ORIENTATIONS
+    upper_bin = (lower_bin + 1) % HOG_ORIENTATIONS
+    upper_weight = bin_position - np.floor(bin_position)
+
+    for cell_y in range(cell_count):
+        y1 = cell_y * HOG_CELL_SIZE
+        y2 = y1 + HOG_CELL_SIZE
+        for cell_x in range(cell_count):
+            x1 = cell_x * HOG_CELL_SIZE
+            x2 = x1 + HOG_CELL_SIZE
+            cell_magnitude = magnitude[y1:y2, x1:x2].reshape(-1)
+            cell_lower = lower_bin[y1:y2, x1:x2].reshape(-1)
+            cell_upper = upper_bin[y1:y2, x1:x2].reshape(-1)
+            cell_upper_weight = upper_weight[y1:y2, x1:x2].reshape(-1)
+            histograms[cell_y, cell_x] += np.bincount(
+                cell_lower,
+                weights=cell_magnitude * (1.0 - cell_upper_weight),
+                minlength=HOG_ORIENTATIONS,
+            ).astype(np.float32)
+            histograms[cell_y, cell_x] += np.bincount(
+                cell_upper,
+                weights=cell_magnitude * cell_upper_weight,
+                minlength=HOG_ORIENTATIONS,
+            ).astype(np.float32)
+
+    blocks = []
+    for block_y in range(cell_count - HOG_BLOCK_CELLS + 1):
+        for block_x in range(cell_count - HOG_BLOCK_CELLS + 1):
+            block = histograms[
+                block_y : block_y + HOG_BLOCK_CELLS,
+                block_x : block_x + HOG_BLOCK_CELLS,
+            ].reshape(-1)
+            block /= np.sqrt(float(np.dot(block, block)) + 1e-12)
+            block = np.minimum(block, 0.2)
+            block /= np.sqrt(float(np.dot(block, block)) + 1e-12)
+            blocks.append(block)
+    return np.concatenate(blocks).astype(np.float32)
+
+
+def extract_shape_feature(gray: np.ndarray, edges: np.ndarray) -> tuple[torch.Tensor, bool]:
+    """提取 HOG 和边缘空间分布；零信息输入显式标记为不可用。"""
+    if gray.shape != (256, 256) or edges.shape != gray.shape:
+        raise ValueError("形状特征要求灰度图和边缘图均为 256 x 256")
+    hog_feature = _compute_hog(gray)
+    edge_feature = cv2.resize(edges, (16, 16), interpolation=cv2.INTER_AREA).reshape(-1).astype(np.float32)
+    feature = torch.from_numpy(np.concatenate((hog_feature, edge_feature)))
+    if feature.numel() != SHAPE_FEATURE_DIMENSION:
+        raise RuntimeError(f"形状特征维度异常: 期望 {SHAPE_FEATURE_DIMENSION}, 实际 {feature.numel()}")
+    norm = torch.linalg.vector_norm(feature)
+    if float(norm.item()) == 0.0:
+        return feature, False
+    return feature / norm, True
+
+
+def cosine_feature_similarity(reference: torch.Tensor, actual: torch.Tensor) -> float:
+    """计算两个一维特征的原始余弦，零向量返回 0 而不进行分数平移。"""
+    if reference.ndim != 1 or actual.ndim != 1 or reference.shape != actual.shape:
+        raise ValueError("余弦相似度要求两个形状相同的一维特征向量")
+    reference_norm = torch.linalg.vector_norm(reference.float())
+    actual_norm = torch.linalg.vector_norm(actual.float())
+    if float(reference_norm.item()) == 0.0 or float(actual_norm.item()) == 0.0:
+        return 0.0
+    return float(torch.dot(reference.float() / reference_norm, actual.float() / actual_norm).item())
+
+
+def compute_channel_scores(
+    baseline_ref: torch.Tensor,
+    baseline_actual: torch.Tensor,
+    gray_ref: torch.Tensor,
+    gray_actual: torch.Tensor,
+    shape_ref: torch.Tensor,
+    shape_actual: torch.Tensor,
+    component: str,
+    shape_available: bool,
+) -> ChannelScores:
+    """计算独立通道分数，并仅在形状通道有效时使用部件实验权重。"""
+    baseline_similarity = cosine_feature_similarity(baseline_ref, baseline_actual)
+    gray_dino_similarity = cosine_feature_similarity(gray_ref, gray_actual)
+    if not shape_available:
+        return ChannelScores(
+            baseline_similarity=baseline_similarity,
+            gray_dino_similarity=gray_dino_similarity,
+            shape_similarity=None,
+            fused_similarity=gray_dino_similarity,
+            channel_gap=None,
+            dino_weight=1.0,
+            shape_weight=0.0,
+            shape_available=False,
+        )
+
+    shape_similarity = cosine_feature_similarity(shape_ref, shape_actual)
+    dino_weight, shape_weight = CHANNEL_WEIGHTS.get(component, (0.5, 0.5))
+    return ChannelScores(
+        baseline_similarity=baseline_similarity,
+        gray_dino_similarity=gray_dino_similarity,
+        shape_similarity=shape_similarity,
+        fused_similarity=dino_weight * gray_dino_similarity + shape_weight * shape_similarity,
+        channel_gap=abs(gray_dino_similarity - shape_similarity),
+        dino_weight=dino_weight,
+        shape_weight=shape_weight,
+        shape_available=True,
+    )
+
+
 class DinoV2FeatureExtractor:
     """使用同一个 DINOv2 ViT-B/14 实例提取 RGB 基线和灰度局部特征。"""
 
@@ -211,8 +358,13 @@ class DinoV2FeatureExtractor:
         patch_weights = self._build_patch_weights(preprocessed)
         weighted_patches = torch.sum(gray_patches * patch_weights.unsqueeze(-1), dim=1)
         gray_dino = F.normalize(0.4 * gray_cls + 0.6 * weighted_patches, dim=1)
+        shape_results = [
+            extract_shape_feature(np.asarray(item.gray_image, dtype=np.uint8), item.edges) for item in preprocessed
+        ]
         return ExtractedFeatureBatch(
             baseline=baseline.cpu(),
             gray_dino=gray_dino.cpu(),
+            shape=torch.stack([feature for feature, _ in shape_results]),
+            shape_available=tuple(available for _, available in shape_results),
             preprocessed=preprocessed,
         )

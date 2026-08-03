@@ -184,6 +184,8 @@ class _FixedFeatureExtractor:
         return ExtractedFeatureBatch(
             baseline=features,
             gray_dino=features.clone(),
+            shape=features.clone(),
+            shape_available=(True, True),
             preprocessed=tuple(preprocess_crop(image) for image in images),
         )
 
@@ -195,6 +197,8 @@ class _FixedParallelFeatureExtractor:
         return ExtractedFeatureBatch(
             baseline=torch.tensor([[1.0, 0.0], [0.6, 0.8]]),
             gray_dino=torch.tensor([[0.0, 1.0], [0.0, 1.0]]),
+            shape=torch.tensor([[1.0, 0.0], [1.0, 0.0]]),
+            shape_available=(True, True),
             preprocessed=tuple(preprocess_crop(image) for image in images),
         )
 
@@ -303,6 +307,8 @@ class _SamePairFeatureExtractor:
         return ExtractedFeatureBatch(
             baseline=features,
             gray_dino=features.clone(),
+            shape=features.clone(),
+            shape_available=tuple(True for _ in images),
             preprocessed=tuple(preprocess_crop(image) for image in images),
         )
 

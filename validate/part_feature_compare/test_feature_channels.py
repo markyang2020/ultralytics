@@ -3,6 +3,7 @@
 import sys
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pytest
 import torch
@@ -10,7 +11,14 @@ from PIL import Image, ImageDraw
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from feature_channels import DinoV2FeatureExtractor, letterbox_square, preprocess_crop
+from feature_channels import (
+    DinoV2FeatureExtractor,
+    compute_channel_scores,
+    cosine_feature_similarity,
+    extract_shape_feature,
+    letterbox_square,
+    preprocess_crop,
+)
 
 
 def test_preprocess_crop_is_identical_for_identical_inputs():
@@ -86,3 +94,66 @@ def test_extractor_rejects_missing_patch_tokens():
 
     with pytest.raises(RuntimeError, match="x_norm_patchtokens"):
         extractor.extract([Image.new("RGB", (20, 20), "white")])
+
+
+def test_shape_feature_is_normalized_without_score_remapping():
+    """防止形状零相似度经二次映射后被错误抬高到0.5。"""
+    gray = np.full((256, 256), 255, dtype=np.uint8)
+    cv2.rectangle(gray, (48, 96), (208, 160), 0, thickness=4)
+    edges = cv2.Canny(gray, 20, 80)
+
+    feature, available = extract_shape_feature(gray, edges)
+
+    assert available is True
+    assert torch.linalg.vector_norm(feature).item() == pytest.approx(1.0)
+    assert cosine_feature_similarity(feature, torch.zeros_like(feature)) == 0.0
+
+
+def test_compute_channel_scores_uses_component_weights():
+    """防止部件实验权重未参与融合或两个通道顺序颠倒。"""
+    scores = compute_channel_scores(
+        baseline_ref=torch.tensor([1.0, 0.0]),
+        baseline_actual=torch.tensor([0.8, 0.6]),
+        gray_ref=torch.tensor([1.0, 0.0]),
+        gray_actual=torch.tensor([0.8, 0.6]),
+        shape_ref=torch.tensor([1.0, 0.0]),
+        shape_actual=torch.tensor([0.4, 0.916515]),
+        component="saddle",
+        shape_available=True,
+    )
+
+    assert scores.baseline_similarity == pytest.approx(0.8)
+    assert scores.gray_dino_similarity == pytest.approx(0.8)
+    assert scores.shape_similarity == pytest.approx(0.4, abs=1e-5)
+    assert scores.fused_similarity == pytest.approx(0.54, abs=1e-5)
+    assert scores.channel_gap == pytest.approx(0.4)
+
+
+def test_compute_channel_scores_ignores_unavailable_shape_channel():
+    """防止空形状特征的固定零分把正常部件融合分数拉低。"""
+    scores = compute_channel_scores(
+        baseline_ref=torch.tensor([1.0, 0.0]),
+        baseline_actual=torch.tensor([0.8, 0.6]),
+        gray_ref=torch.tensor([1.0, 0.0]),
+        gray_actual=torch.tensor([0.8, 0.6]),
+        shape_ref=torch.tensor([1.0, 0.0]),
+        shape_actual=torch.tensor([0.4, 0.916515]),
+        component="saddle",
+        shape_available=False,
+    )
+
+    assert scores.fused_similarity == pytest.approx(0.8)
+    assert scores.shape_similarity is None
+    assert scores.channel_gap is None
+    assert scores.dino_weight == 1.0
+    assert scores.shape_weight == 0.0
+
+
+def test_extractor_includes_shape_feature_for_each_crop():
+    """防止DINO批次和CPU形状特征数量错位。"""
+    extractor = DinoV2FeatureExtractor(device="cpu", model=_FakeDinoModel())
+
+    result = extractor.extract([Image.new("RGB", (40, 20), "black")])
+
+    assert result.shape.shape == (1, 2020)
+    assert result.shape_available == (True,)
