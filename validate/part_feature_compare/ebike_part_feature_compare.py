@@ -14,10 +14,15 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence, Tuple
 
 import torch
-import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-from feature_channels import DinoV2FeatureExtractor
+from feature_channels import (
+    ChannelScores,
+    DinoV2FeatureExtractor,
+    PreprocessedCrop,
+    compute_channel_scores,
+    cosine_feature_similarity,
+)
 
 Box = Tuple[float, float, float, float]
 ClippedBox = Tuple[int, int, int, int]
@@ -53,6 +58,11 @@ class MatchedPart:
     similarity: float
     verdict: str
     verdict_text: str
+    experimental: ChannelScores
+    experimental_verdict: str
+    experimental_verdict_text: str
+    reference_preprocessed: PreprocessedCrop
+    actual_preprocessed: PreprocessedCrop
 
 
 def classify_similarity(score: float, similar_threshold: float, review_threshold: float) -> tuple[str, str]:
@@ -101,11 +111,7 @@ def pair_detections(
 
 def cosine_similarity(reference: torch.Tensor, actual: torch.Tensor) -> float:
     """显式归一化两个一维特征向量并计算余弦相似度。"""
-    if reference.ndim != 1 or actual.ndim != 1 or reference.shape != actual.shape:
-        raise ValueError("余弦相似度要求两个形状相同的一维特征向量")
-    reference_normalized = F.normalize(reference.float(), dim=0)
-    actual_normalized = F.normalize(actual.float(), dim=0)
-    return float(torch.dot(reference_normalized, actual_normalized).item())
+    return cosine_feature_similarity(reference, actual)
 
 
 def parse_yolo_result(result: Any) -> dict[str, Detection]:
@@ -152,16 +158,41 @@ def compare_matched_parts(
         crops.extend((reference_crop, actual_crop))
 
     feature_batch = feature_extractor.extract(crops)
-    features = feature_batch.baseline
-    if features.shape[0] != len(crops):
-        raise RuntimeError(f"DINOv2 特征数量异常: 期望 {len(crops)}, 实际 {features.shape[0]}")
+    for name, features in (
+        ("RGB CLS", feature_batch.baseline),
+        ("灰度 DINO", feature_batch.gray_dino),
+        ("形状", feature_batch.shape),
+    ):
+        if features.shape[0] != len(crops):
+            raise RuntimeError(f"{name} 特征数量异常: 期望 {len(crops)}, 实际 {features.shape[0]}")
+    if len(feature_batch.shape_available) != len(crops) or len(feature_batch.preprocessed) != len(crops):
+        raise RuntimeError("实验特征的可用性或预处理证据数量与部件裁剪不一致")
 
     compared = []
     for index, (part_name, reference_detection, actual_detection, reference_crop, actual_crop) in enumerate(
         paired_crops
     ):
-        similarity = cosine_similarity(features[index * 2], features[index * 2 + 1])
+        reference_index = index * 2
+        actual_index = reference_index + 1
+        experimental = compute_channel_scores(
+            baseline_ref=feature_batch.baseline[reference_index],
+            baseline_actual=feature_batch.baseline[actual_index],
+            gray_ref=feature_batch.gray_dino[reference_index],
+            gray_actual=feature_batch.gray_dino[actual_index],
+            shape_ref=feature_batch.shape[reference_index],
+            shape_actual=feature_batch.shape[actual_index],
+            component=part_name,
+            shape_available=(
+                feature_batch.shape_available[reference_index] and feature_batch.shape_available[actual_index]
+            ),
+        )
+        similarity = experimental.baseline_similarity
         verdict, verdict_text = classify_similarity(similarity, similar_threshold, review_threshold)
+        experimental_verdict, experimental_verdict_text = classify_similarity(
+            experimental.fused_similarity,
+            similar_threshold,
+            review_threshold,
+        )
         compared.append(
             MatchedPart(
                 part_name=part_name,
@@ -172,6 +203,11 @@ def compare_matched_parts(
                 similarity=similarity,
                 verdict=verdict,
                 verdict_text=verdict_text,
+                experimental=experimental,
+                experimental_verdict=experimental_verdict,
+                experimental_verdict_text=experimental_verdict_text,
+                reference_preprocessed=feature_batch.preprocessed[reference_index],
+                actual_preprocessed=feature_batch.preprocessed[actual_index],
             )
         )
     return compared
@@ -199,14 +235,20 @@ def build_report(
     actual_only: Sequence[Detection],
 ) -> dict[str, Any]:
     """构建包含复现实验信息和全部比对证据的结构化报告。"""
-    if any(part.verdict == "inconsistent" for part in matched_parts):
-        verdict, verdict_text = "inconsistent", "存在部件外观不一致"
-    elif any(part.verdict == "review" for part in matched_parts):
-        verdict, verdict_text = "review", "存在疑似更换部件，需人工复核"
-    elif matched_parts:
-        verdict, verdict_text = "consistent", "已比较部件外观一致"
-    else:
-        verdict, verdict_text = "unable_to_compare", "没有双方共同检测到的部件"
+
+    def summarize(verdicts: Sequence[str]) -> tuple[str, str]:
+        if "inconsistent" in verdicts:
+            return "inconsistent", "存在部件外观不一致"
+        if "review" in verdicts:
+            return "review", "存在疑似更换部件，需人工复核"
+        if verdicts:
+            return "consistent", "已比较部件外观一致"
+        return "unable_to_compare", "没有双方共同检测到的部件"
+
+    verdict, verdict_text = summarize([part.verdict for part in matched_parts])
+    experimental_verdict, experimental_verdict_text = summarize(
+        [part.experimental_verdict for part in matched_parts]
+    )
 
     matched_payload = []
     for part in matched_parts:
@@ -218,6 +260,31 @@ def build_report(
                 "similarity": round(part.similarity, 6),
                 "verdict": part.verdict,
                 "verdict_text": part.verdict_text,
+                "experimental": {
+                    "gray_dino_similarity": round(part.experimental.gray_dino_similarity, 6),
+                    "shape_similarity": (
+                        round(part.experimental.shape_similarity, 6)
+                        if part.experimental.shape_similarity is not None
+                        else None
+                    ),
+                    "fused_similarity": round(part.experimental.fused_similarity, 6),
+                    "channel_gap": (
+                        round(part.experimental.channel_gap, 6)
+                        if part.experimental.channel_gap is not None
+                        else None
+                    ),
+                    "shape_available": part.experimental.shape_available,
+                    "weights": {
+                        "dino": part.experimental.dino_weight,
+                        "shape": part.experimental.shape_weight,
+                    },
+                    "verdict": part.experimental_verdict,
+                    "verdict_text": part.experimental_verdict_text,
+                    "preprocessing": {
+                        "reference_foreground_fallback": part.reference_preprocessed.foreground_fallback,
+                        "actual_foreground_fallback": part.actual_preprocessed.foreground_fallback,
+                    },
+                },
             }
         )
 
@@ -235,6 +302,10 @@ def build_report(
         },
         "verdict": verdict,
         "verdict_text": verdict_text,
+        "baseline_verdict": verdict,
+        "baseline_verdict_text": verdict_text,
+        "experimental_verdict": experimental_verdict,
+        "experimental_verdict_text": experimental_verdict_text,
         "matched_parts": matched_payload,
         "unmatched_parts": unmatched_payload,
     }
@@ -360,7 +431,7 @@ def _annotate_detections(
         draw.rectangle(box, outline=color, width=line_width)
         label = f"{part_name} conf={detection.confidence:.2f}"
         if matched_part:
-            label += f" sim={matched_part.similarity:.3f}"
+            label += f" base={matched_part.similarity:.3f} exp={matched_part.experimental.fused_similarity:.3f}"
         text_box = draw.textbbox((0, 0), label, font=font)
         label_size = (text_box[2] - text_box[0] + 6, text_box[3] - text_box[1] + 6)
         label_box = place_label_box(box, label_size, annotated.size, occupied)
@@ -389,16 +460,43 @@ def save_visualizations(
         part_dir.mkdir(parents=True, exist_ok=True)
         part.reference_crop.save(part_dir / "reference.jpg", quality=95)
         part.actual_crop.save(part_dir / "actual.jpg", quality=95)
+        part.reference_preprocessed.gray_image.save(part_dir / "reference_preprocessed.jpg", quality=95)
+        part.actual_preprocessed.gray_image.save(part_dir / "actual_preprocessed.jpg", quality=95)
+        Image.fromarray(part.reference_preprocessed.mask).save(part_dir / "reference_mask.png")
+        Image.fromarray(part.actual_preprocessed.mask).save(part_dir / "actual_mask.png")
+        Image.fromarray(part.reference_preprocessed.edges).save(part_dir / "reference_edges.png")
+        Image.fromarray(part.actual_preprocessed.edges).save(part_dir / "actual_edges.png")
 
-        canvas = Image.new("RGB", (1000, 500), "white")
+        canvas = Image.new("RGB", (1000, 560), "white")
         draw = ImageDraw.Draw(canvas)
         color = VERDICT_COLORS[part.verdict]
-        draw.text((20, 14), f"{part.part_name}  similarity={part.similarity:.4f}", fill=color, font=font)
-        draw.text((20, 48), part.verdict_text, fill=color, font=small_font)
-        canvas.paste(_fit_panel(part.reference_crop, (480, 390)), (10, 95))
-        canvas.paste(_fit_panel(part.actual_crop, (480, 390)), (510, 95))
-        draw.text((20, 98), f"Reference conf={part.reference_detection.confidence:.3f}", fill="black", font=small_font)
-        draw.text((520, 98), f"Actual conf={part.actual_detection.confidence:.3f}", fill="black", font=small_font)
+        shape_text = (
+            f"{part.experimental.shape_similarity:.4f}"
+            if part.experimental.shape_similarity is not None
+            else "unavailable"
+        )
+        draw.text(
+            (20, 14),
+            f"{part.part_name}  baseline={part.similarity:.4f}  experimental={part.experimental.fused_similarity:.4f}",
+            fill=color,
+            font=font,
+        )
+        draw.text(
+            (20, 48),
+            f"gray_dino={part.experimental.gray_dino_similarity:.4f}  shape={shape_text}",
+            fill="black",
+            font=small_font,
+        )
+        draw.text(
+            (20, 78),
+            f"baseline: {part.verdict_text} | experimental: {part.experimental_verdict_text}",
+            fill=color,
+            font=small_font,
+        )
+        canvas.paste(_fit_panel(part.reference_crop, (480, 410)), (10, 135))
+        canvas.paste(_fit_panel(part.actual_crop, (480, 410)), (510, 135))
+        draw.text((20, 138), f"Reference conf={part.reference_detection.confidence:.3f}", fill="black", font=small_font)
+        draw.text((520, 138), f"Actual conf={part.actual_detection.confidence:.3f}", fill="black", font=small_font)
         canvas.save(part_dir / "comparison.jpg", quality=95)
 
     reference_annotated = _annotate_detections(reference_image, reference_detections, matched_by_name)
@@ -420,18 +518,21 @@ def save_visualizations(
 def _print_report(report: dict[str, Any], report_path: Path) -> None:
     """把最常用结果输出为便于实验核对的中文表格。"""
     print("\n===== 部件外观特征比对结果 =====")
-    print(f"{'部件':<20} {'备案置信度':>10} {'实拍置信度':>10} {'相似度':>10}  判定")
+    print(f"{'部件':<20} {'备案置信度':>10} {'实拍置信度':>10} {'基线':>9} {'实验':>9}  基线/实验判定")
     for part in report["matched_parts"]:
         print(
             f"{part['part']:<20} "
             f"{part['reference_detection']['confidence']:>10.4f} "
             f"{part['actual_detection']['confidence']:>10.4f} "
-            f"{part['similarity']:>10.4f}  {part['verdict_text']}"
+            f"{part['similarity']:>9.4f} "
+            f"{part['experimental']['fused_similarity']:>9.4f}  "
+            f"{part['verdict_text']} / {part['experimental']['verdict_text']}"
         )
     if report["unmatched_parts"]:
         names = ", ".join(f"{part['part']}({part['side']})" for part in report["unmatched_parts"])
         print(f"未进入 Level 2: {names}")
-    print(f"综合结果: {report['verdict_text']}")
+    print(f"基线综合结果: {report['baseline_verdict_text']}")
+    print(f"实验综合结果: {report['experimental_verdict_text']}")
     print(f"JSON 报告: {report_path}")
     print(f"汇总图: {report['artifacts']['summary']}")
 

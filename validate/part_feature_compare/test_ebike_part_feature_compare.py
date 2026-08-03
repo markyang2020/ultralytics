@@ -218,6 +218,30 @@ def test_compare_matched_parts_reads_baseline_from_parallel_feature_batch():
     )
 
     assert compared[0].similarity == pytest.approx(0.6)
+    assert compared[0].verdict == "review"
+    assert compared[0].experimental.gray_dino_similarity == pytest.approx(1.0)
+    assert compared[0].experimental.shape_similarity == pytest.approx(1.0)
+    assert compared[0].experimental.fused_similarity == pytest.approx(1.0)
+    assert compared[0].experimental_verdict == "consistent"
+
+    report = build_report(
+        reference_path=Path("reference.jpg"),
+        actual_path=Path("actual.jpg"),
+        detector_path=Path("model.pt"),
+        detection_threshold=0.6,
+        similar_threshold=0.8,
+        review_threshold=0.6,
+        matched_parts=compared,
+        reference_only=[],
+        actual_only=[],
+    )
+    part_payload = report["matched_parts"][0]
+    assert part_payload["similarity"] == pytest.approx(0.6)
+    assert part_payload["verdict"] == "review"
+    assert part_payload["experimental"]["fused_similarity"] == pytest.approx(1.0)
+    assert part_payload["experimental"]["weights"] == {"dino": 0.35, "shape": 0.65}
+    assert report["verdict"] == report["baseline_verdict"] == "review"
+    assert report["experimental_verdict"] == "consistent"
 
 
 def test_compare_matched_parts_uses_paired_crops_and_similarity_thresholds():
@@ -338,12 +362,21 @@ def test_run_comparison_writes_report_summary_and_part_evidence(tmp_path):
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["verdict"] == "consistent"
+    assert report["baseline_verdict"] == "consistent"
+    assert report["experimental_verdict"] == "consistent"
     assert [part["part"] for part in report["matched_parts"]] == ["ebike_full", "saddle"]
+    assert report["matched_parts"][0]["experimental"]["fused_similarity"] == pytest.approx(1.0)
     assert report["unmatched_parts"][0]["part"] == "rear_box"
     assert (output_dir / "comparison_summary.jpg").is_file()
     assert (output_dir / "crops" / "saddle" / "reference.jpg").is_file()
     assert (output_dir / "crops" / "saddle" / "actual.jpg").is_file()
     assert (output_dir / "crops" / "saddle" / "comparison.jpg").is_file()
+    assert (output_dir / "crops" / "saddle" / "reference_preprocessed.jpg").is_file()
+    assert (output_dir / "crops" / "saddle" / "actual_preprocessed.jpg").is_file()
+    assert (output_dir / "crops" / "saddle" / "reference_mask.png").is_file()
+    assert (output_dir / "crops" / "saddle" / "actual_mask.png").is_file()
+    assert (output_dir / "crops" / "saddle" / "reference_edges.png").is_file()
+    assert (output_dir / "crops" / "saddle" / "actual_edges.png").is_file()
 
 
 def test_place_label_box_keeps_label_inside_canvas_and_avoids_collision():
