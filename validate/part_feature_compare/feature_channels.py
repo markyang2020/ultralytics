@@ -5,10 +5,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Sequence
 
 import cv2
 import numpy as np
+import torch
+import torch.nn.functional as F
 from PIL import Image
+from torchvision import transforms
 
 
 @dataclass(frozen=True)
@@ -19,6 +23,15 @@ class PreprocessedCrop:
     mask: np.ndarray
     edges: np.ndarray
     foreground_fallback: str | None
+
+
+@dataclass(frozen=True)
+class ExtractedFeatureBatch:
+    """保存同一批裁剪的原始基线、灰度局部特征和预处理证据。"""
+
+    baseline: torch.Tensor
+    gray_dino: torch.Tensor
+    preprocessed: tuple[PreprocessedCrop, ...]
 
 
 def extract_foreground_mask(image: Image.Image) -> tuple[np.ndarray, str | None]:
@@ -108,3 +121,98 @@ def preprocess_crop(image: Image.Image) -> PreprocessedCrop:
         edges=edges,
         foreground_fallback=fallback,
     )
+
+
+class DinoV2FeatureExtractor:
+    """使用同一个 DINOv2 ViT-B/14 实例提取 RGB 基线和灰度局部特征。"""
+
+    model_name = "dinov2_vitb14"
+    feature_dimension = 768
+    patch_grid_size = 16
+
+    def __init__(self, device: str, model: torch.nn.Module | None = None):
+        """初始化特征模型；测试可注入模型以隔离网络下载。"""
+        self.device = torch.device(device)
+        if model is None:
+            try:
+                model = torch.hub.load("facebookresearch/dinov2", self.model_name, trust_repo=True)
+            except Exception as error:
+                message = f"DINOv2 ViT-B/14 加载失败，请检查网络或 ~/.cache/torch/hub 缓存: {error}"
+                raise RuntimeError(message) from error
+        self.model = model.to(self.device).eval()
+        self.transform = transforms.Compose(
+            [
+                transforms.Resize((224, 224), interpolation=transforms.InterpolationMode.BICUBIC),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ]
+        )
+
+    def _validate_outputs(
+        self,
+        output: object,
+        expected_count: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """校验官方 forward_features 字段和本 Demo 固定的 ViT-B/14 维度。"""
+        cls_tokens = output.get("x_norm_clstoken") if isinstance(output, dict) else None
+        patch_tokens = output.get("x_norm_patchtokens") if isinstance(output, dict) else None
+        if not isinstance(cls_tokens, torch.Tensor) or cls_tokens.ndim != 2:
+            raise RuntimeError("DINOv2 未返回二维 x_norm_clstoken 特征")
+        if not isinstance(patch_tokens, torch.Tensor) or patch_tokens.ndim != 3:
+            raise RuntimeError("DINOv2 未返回三维 x_norm_patchtokens 特征")
+        if cls_tokens.shape != (expected_count, self.feature_dimension):
+            raise RuntimeError(
+                "DINOv2 CLS 特征维度异常: "
+                f"期望 {(expected_count, self.feature_dimension)}, 实际 {tuple(cls_tokens.shape)}"
+            )
+        expected_patches = self.patch_grid_size**2
+        if patch_tokens.shape != (expected_count, expected_patches, self.feature_dimension):
+            raise RuntimeError(
+                "DINOv2 patch 特征维度异常: "
+                f"期望 {(expected_count, expected_patches, self.feature_dimension)}, "
+                f"实际 {tuple(patch_tokens.shape)}"
+            )
+        return cls_tokens, patch_tokens
+
+    def _build_patch_weights(self, preprocessed: Sequence[PreprocessedCrop]) -> torch.Tensor:
+        """把可审计前景掩码缩放到 DINOv2 patch 网格并归一化。"""
+        weights = []
+        for item in preprocessed:
+            resized = cv2.resize(
+                item.mask.astype(np.float32) / 255.0,
+                (self.patch_grid_size, self.patch_grid_size),
+                interpolation=cv2.INTER_AREA,
+            ).reshape(-1)
+            if not np.any(resized):
+                resized.fill(1.0)
+            resized /= resized.sum()
+            weights.append(torch.from_numpy(resized))
+        return torch.stack(weights).to(self.device)
+
+    @torch.inference_mode()
+    def extract(self, images: Sequence[Image.Image]) -> ExtractedFeatureBatch:
+        """批量提取原 RGB CLS 基线和灰度前景加权 patch 融合特征。"""
+        if not images:
+            raise ValueError("至少需要一张部件图片才能提取 DINOv2 特征")
+
+        preprocessed = tuple(preprocess_crop(image) for image in images)
+        rgb_batch = torch.stack([self.transform(image.convert("RGB")) for image in images])
+        gray_batch = torch.stack([self.transform(item.gray_image.convert("RGB")) for item in preprocessed])
+        combined_batch = torch.cat((rgb_batch, gray_batch)).to(self.device)
+        cls_tokens, patch_tokens = self._validate_outputs(
+            self.model.forward_features(combined_batch),
+            expected_count=len(images) * 2,
+        )
+
+        count = len(images)
+        baseline = F.normalize(cls_tokens[:count].float(), dim=1)
+        gray_cls = cls_tokens[count:].float()
+        gray_patches = patch_tokens[count:].float()
+        patch_weights = self._build_patch_weights(preprocessed)
+        weighted_patches = torch.sum(gray_patches * patch_weights.unsqueeze(-1), dim=1)
+        gray_dino = F.normalize(0.4 * gray_cls + 0.6 * weighted_patches, dim=1)
+        return ExtractedFeatureBatch(
+            baseline=baseline.cpu(),
+            gray_dino=gray_dino.cpu(),
+            preprocessed=preprocessed,
+        )

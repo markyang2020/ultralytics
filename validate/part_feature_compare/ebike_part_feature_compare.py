@@ -16,7 +16,8 @@ from typing import Any, Iterable, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont, ImageOps
-from torchvision import transforms
+
+from feature_channels import DinoV2FeatureExtractor
 
 Box = Tuple[float, float, float, float]
 ClippedBox = Tuple[int, int, int, int]
@@ -130,45 +131,6 @@ def crop_detection(image: Image.Image, detection: Detection) -> Image.Image:
     return rgb_image.crop(box)
 
 
-class DinoV2FeatureExtractor:
-    """使用官方 DINOv2 ViT-B/14 提取并归一化 CLS token。"""
-
-    model_name = "dinov2_vitb14"
-    feature_dimension = 768
-
-    def __init__(self, device: str, model: torch.nn.Module | None = None):
-        """初始化特征模型；测试可注入模型以隔离网络下载。"""
-        self.device = torch.device(device)
-        if model is None:
-            try:
-                model = torch.hub.load("facebookresearch/dinov2", self.model_name, trust_repo=True)
-            except Exception as error:
-                message = f"DINOv2 ViT-B/14 加载失败，请检查网络或 ~/.cache/torch/hub 缓存: {error}"
-                raise RuntimeError(message) from error
-        self.model = model.to(self.device).eval()
-        self.transform = transforms.Compose(
-            [
-                transforms.Resize((224, 224), interpolation=transforms.InterpolationMode.BICUBIC),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-            ]
-        )
-
-    @torch.inference_mode()
-    def extract(self, images: Sequence[Image.Image]) -> torch.Tensor:
-        """批量提取部件图的 768 维 L2 归一化特征。"""
-        if not images:
-            raise ValueError("至少需要一张部件图片才能提取 DINOv2 特征")
-        batch = torch.stack([self.transform(image.convert("RGB")) for image in images]).to(self.device)
-        output = self.model.forward_features(batch)
-        features = output.get("x_norm_clstoken") if isinstance(output, dict) else None
-        if not isinstance(features, torch.Tensor) or features.ndim != 2:
-            raise RuntimeError("DINOv2 未返回二维 x_norm_clstoken 特征")
-        if features.shape[1] != self.feature_dimension:
-            raise RuntimeError(f"DINOv2 特征维度异常: 期望 {self.feature_dimension}, 实际 {features.shape[1]}")
-        return F.normalize(features.float(), dim=1).cpu()
-
-
 def compare_matched_parts(
     matched: Sequence[tuple[str, Detection, Detection]],
     reference_image: Image.Image,
@@ -189,7 +151,8 @@ def compare_matched_parts(
         paired_crops.append((part_name, reference_detection, actual_detection, reference_crop, actual_crop))
         crops.extend((reference_crop, actual_crop))
 
-    features = feature_extractor.extract(crops)
+    feature_batch = feature_extractor.extract(crops)
+    features = feature_batch.baseline
     if features.shape[0] != len(crops):
         raise RuntimeError(f"DINOv2 特征数量异常: 期望 {len(crops)}, 实际 {features.shape[0]}")
 

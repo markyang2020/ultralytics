@@ -31,6 +31,7 @@ from ebike_part_feature_compare import (
     select_best_detections,
     validate_thresholds,
 )
+from feature_channels import ExtractedFeatureBatch, preprocess_crop
 
 
 @pytest.mark.parametrize(
@@ -127,7 +128,9 @@ class _FakeDinoModel(torch.nn.Module):
     def forward_features(self, batch):
         features = torch.zeros((batch.shape[0], 768), device=batch.device)
         features[:, 0] = 2.0
-        return {"x_norm_clstoken": features}
+        patches = torch.zeros((batch.shape[0], 256, 768), device=batch.device)
+        patches[:, :, 1] = 1.0
+        return {"x_norm_clstoken": features, "x_norm_patchtokens": patches}
 
 
 def test_dinov2_extractor_returns_normalized_768d_features():
@@ -136,8 +139,8 @@ def test_dinov2_extractor_returns_normalized_768d_features():
 
     features = extractor.extract([Image.new("RGB", (20, 10), "white"), Image.new("RGB", (8, 16), "black")])
 
-    assert features.shape == (2, 768)
-    assert torch.linalg.vector_norm(features, dim=1).tolist() == pytest.approx([1.0, 1.0])
+    assert features.baseline.shape == (2, 768)
+    assert torch.linalg.vector_norm(features.baseline, dim=1).tolist() == pytest.approx([1.0, 1.0])
 
 
 def test_dinov2_load_error_preserves_upstream_reason(monkeypatch):
@@ -177,7 +180,40 @@ class _FixedFeatureExtractor:
 
     def extract(self, images):
         assert [image.size for image in images] == [(4, 4), (4, 4)]
-        return torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+        features = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+        return ExtractedFeatureBatch(
+            baseline=features,
+            gray_dino=features.clone(),
+            preprocessed=tuple(preprocess_crop(image) for image in images),
+        )
+
+
+class _FixedParallelFeatureExtractor:
+    """返回V2结构化批次，验证主流水线使用独立RGB基线字段。"""
+
+    def extract(self, images):
+        return ExtractedFeatureBatch(
+            baseline=torch.tensor([[1.0, 0.0], [0.6, 0.8]]),
+            gray_dino=torch.tensor([[0.0, 1.0], [0.0, 1.0]]),
+            preprocessed=tuple(preprocess_crop(image) for image in images),
+        )
+
+
+def test_compare_matched_parts_reads_baseline_from_parallel_feature_batch():
+    """防止V2提取器接入后旧编排仍把结构化批次当Tensor使用。"""
+    reference_detection = Detection(5, "saddle", 0.93, (1, 1, 5, 5))
+    actual_detection = Detection(5, "saddle", 0.79, (2, 2, 6, 6))
+
+    compared = compare_matched_parts(
+        [("saddle", reference_detection, actual_detection)],
+        Image.new("RGB", (8, 8), "white"),
+        Image.new("RGB", (8, 8), "black"),
+        _FixedParallelFeatureExtractor(),
+        similar_threshold=0.8,
+        review_threshold=0.6,
+    )
+
+    assert compared[0].similarity == pytest.approx(0.6)
 
 
 def test_compare_matched_parts_uses_paired_crops_and_similarity_thresholds():
@@ -264,7 +300,11 @@ class _SamePairFeatureExtractor:
     def extract(self, images):
         features = torch.zeros((len(images), 768))
         features[:, 0] = 1.0
-        return features
+        return ExtractedFeatureBatch(
+            baseline=features,
+            gray_dino=features.clone(),
+            preprocessed=tuple(preprocess_crop(image) for image in images),
+        )
 
 
 def test_run_comparison_writes_report_summary_and_part_evidence(tmp_path):

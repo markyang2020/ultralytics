@@ -5,11 +5,12 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 from PIL import Image, ImageDraw
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from feature_channels import letterbox_square, preprocess_crop
+from feature_channels import DinoV2FeatureExtractor, letterbox_square, preprocess_crop
 
 
 def test_preprocess_crop_is_identical_for_identical_inputs():
@@ -47,3 +48,41 @@ def test_preprocess_crop_records_fallback_for_empty_foreground():
     assert result.foreground_fallback == "foreground_mask_empty"
     assert result.mask[128, 128] == 255
     assert result.mask[0, 0] == 0
+
+
+class _FakeDinoModel(torch.nn.Module):
+    """返回官方 forward_features 字段，隔离真实权重和网络。"""
+
+    def forward_features(self, batch):
+        count = batch.shape[0]
+        cls = torch.zeros((count, 768), device=batch.device)
+        cls[:, 0] = 2.0
+        patches = torch.zeros((count, 256, 768), device=batch.device)
+        patches[:, :, 1] = 1.0
+        return {"x_norm_clstoken": cls, "x_norm_patchtokens": patches}
+
+
+def test_extractor_returns_parallel_normalized_features():
+    """防止V2覆盖RGB基线，或灰度局部特征遗漏归一化。"""
+    extractor = DinoV2FeatureExtractor(device="cpu", model=_FakeDinoModel())
+
+    result = extractor.extract([Image.new("RGB", (40, 20), "black")])
+
+    assert result.baseline.shape == (1, 768)
+    assert result.gray_dino.shape == (1, 768)
+    assert torch.linalg.vector_norm(result.baseline, dim=1).tolist() == pytest.approx([1.0])
+    assert torch.linalg.vector_norm(result.gray_dino, dim=1).tolist() == pytest.approx([1.0])
+    assert result.gray_dino[0, 1] > 0
+
+
+def test_extractor_rejects_missing_patch_tokens():
+    """防止官方模型接口漂移后静默退化成另一套算法。"""
+
+    class MissingPatchModel(_FakeDinoModel):
+        def forward_features(self, batch):
+            return {"x_norm_clstoken": super().forward_features(batch)["x_norm_clstoken"]}
+
+    extractor = DinoV2FeatureExtractor(device="cpu", model=MissingPatchModel())
+
+    with pytest.raises(RuntimeError, match="x_norm_patchtokens"):
+        extractor.extract([Image.new("RGB", (20, 20), "white")])
