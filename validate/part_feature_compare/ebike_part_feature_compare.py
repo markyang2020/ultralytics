@@ -576,9 +576,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def _resolve_device(device: str) -> str:
     """根据本机能力把 auto 解析为 YOLO 和 DINOv2 均支持的设备。"""
     if device != "auto":
-        return device
+        return f"cuda:{device}" if device.isdigit() else device
     if torch.cuda.is_available():
-        return "0"
+        return "cuda:0"
     if torch.backends.mps.is_available():
         return "mps"
     return "cpu"

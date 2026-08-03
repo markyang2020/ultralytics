@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ebike_part_feature_compare import (
     Detection,
     DinoV2FeatureExtractor,
+    _resolve_device,
     build_report,
     classify_similarity,
     clip_box,
@@ -313,3 +314,8 @@ def test_place_label_box_keeps_label_inside_canvas_and_avoids_collision():
     assert label_box == (50, 18, 100, 34)
     assert label_box[0] >= 0 and label_box[2] <= 100
     assert label_box[1] >= 0 and label_box[3] <= 60
+
+
+def test_resolve_device_normalizes_cuda_index_for_pytorch():
+    """防止 YOLO 可识别的设备编号传给 torch.device 后变成无效字符串。"""
+    assert _resolve_device("0") == "cuda:0"
