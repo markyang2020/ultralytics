@@ -287,7 +287,7 @@ def resolve_inputs(order_dir: Path | None, reference_path: Path | None, actual_p
 
     if order_dir is not None:
         reference_path = order_dir / "reference_3c.jpg"
-        actual_path = order_dir / "actual_left_front_45.jpg"
+        actual_path = order_dir / "actual_bike_weight.jpg"
     elif reference_path is None or actual_path is None:
         raise ValueError("显式图片模式必须同时提供 --reference 和 --actual")
 
@@ -560,7 +560,7 @@ def run_comparison(
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """解析单订单部件特征比对命令行参数。"""
     parser = argparse.ArgumentParser(description="电动自行车备案图与实拍图部件外观特征比对 Demo")
-    parser.add_argument("--order-dir", type=Path, help="订单目录，读取 reference_3c.jpg 和 actual_left_front_45.jpg")
+    parser.add_argument("--order-dir", type=Path, help="订单目录，读取 reference_3c.jpg 和 actual_bike_weight.jpg")
     parser.add_argument("--reference", type=Path, help="显式指定 3C 合格证官方图")
     parser.add_argument("--actual", type=Path, help="显式指定现场实拍图")
     parser.add_argument("--detector", type=Path, default=DEFAULT_DETECTOR, help="YOLO 部件检测权重")

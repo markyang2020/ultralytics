@@ -203,7 +203,7 @@ def test_compare_matched_parts_uses_paired_crops_and_similarity_thresholds():
 def test_resolve_inputs_reads_fixed_order_filenames(tmp_path):
     """防止订单模式读取到错误文件名或交换备案图和实拍图。"""
     reference = tmp_path / "reference_3c.jpg"
-    actual = tmp_path / "actual_left_front_45.jpg"
+    actual = tmp_path / "actual_bike_weight.jpg"
     reference.touch()
     actual.touch()
 
