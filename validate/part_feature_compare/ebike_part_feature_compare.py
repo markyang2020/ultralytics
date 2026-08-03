@@ -2,14 +2,16 @@
 
 """电动自行车备案图与实拍图的部件外观特征比对 Demo。"""
 
+from __future__ import annotations
+
 import argparse
 import json
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from math import ceil, floor
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Iterable, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -19,12 +21,8 @@ from torchvision import transforms
 Box = Tuple[float, float, float, float]
 ClippedBox = Tuple[int, int, int, int]
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_DETECTOR = Path(
-    "/Users/mark/Workspace/ultralytics/yunst_ai/validate_best_model/yolo11l_12000_best.pt"
-)
-DEFAULT_ORDER_DIR = Path(
-    "/Users/mark/Workspace/ultralytics/validate/orders/2071943118060388353_214522621506984"
-)
+DEFAULT_DETECTOR = Path("/Users/mark/Workspace/ultralytics/yunst_ai/validate_best_model/yolo11l_12000_best.pt")
+DEFAULT_ORDER_DIR = Path("/Users/mark/Workspace/ultralytics/validate/orders/2071943118060388353_214522621506984")
 VERDICT_COLORS = {
     "consistent": (34, 139, 94),
     "review": (222, 143, 0),
@@ -56,9 +54,7 @@ class MatchedPart:
     verdict_text: str
 
 
-def classify_similarity(
-    score: float, similar_threshold: float, review_threshold: float
-) -> Tuple[str, str]:
+def classify_similarity(score: float, similar_threshold: float, review_threshold: float) -> tuple[str, str]:
     """按技术方案的两个阈值返回结果代码和中文判定。"""
     if score >= similar_threshold:
         return "consistent", "部件一致"
@@ -81,9 +77,9 @@ def clip_box(box: Box, width: int, height: int) -> ClippedBox:
     return clipped
 
 
-def select_best_detections(detections: Iterable[Detection]) -> Dict[str, Detection]:
+def select_best_detections(detections: Iterable[Detection]) -> dict[str, Detection]:
     """每个类别只保留最高置信度框，形成确定的单部件匹配基线。"""
-    selected: Dict[str, Detection] = {}
+    selected: dict[str, Detection] = {}
     for detection in detections:
         current = selected.get(detection.class_name)
         if current is None or detection.confidence > current.confidence:
@@ -92,8 +88,8 @@ def select_best_detections(detections: Iterable[Detection]) -> Dict[str, Detecti
 
 
 def pair_detections(
-    reference: Dict[str, Detection], actual: Dict[str, Detection]
-) -> Tuple[List[Tuple[str, Detection, Detection]], List[Detection], List[Detection]]:
+    reference: dict[str, Detection], actual: dict[str, Detection]
+) -> tuple[list[tuple[str, Detection, Detection]], list[Detection], list[Detection]]:
     """拆分双方共同部件和单侧部件，单侧部件不进入 Level 2。"""
     common_names = sorted(reference.keys() & actual.keys())
     matched = [(name, reference[name], actual[name]) for name in common_names]
@@ -111,7 +107,7 @@ def cosine_similarity(reference: torch.Tensor, actual: torch.Tensor) -> float:
     return float(torch.dot(reference_normalized, actual_normalized).item())
 
 
-def parse_yolo_result(result: Any) -> Dict[str, Detection]:
+def parse_yolo_result(result: Any) -> dict[str, Detection]:
     """把 Ultralytics Results 转成按类别选择后的轻量检测对象。"""
     detections = []
     for class_id, confidence, box in zip(result.boxes.cls, result.boxes.conf, result.boxes.xyxy):
@@ -140,16 +136,15 @@ class DinoV2FeatureExtractor:
     model_name = "dinov2_vitb14"
     feature_dimension = 768
 
-    def __init__(self, device: str, model: Optional[torch.nn.Module] = None):
+    def __init__(self, device: str, model: torch.nn.Module | None = None):
         """初始化特征模型；测试可注入模型以隔离网络下载。"""
         self.device = torch.device(device)
         if model is None:
             try:
                 model = torch.hub.load("facebookresearch/dinov2", self.model_name, trust_repo=True)
             except Exception as error:
-                raise RuntimeError(
-                    "DINOv2 ViT-B/14 加载失败，请检查网络或 ~/.cache/torch/hub 缓存"
-                ) from error
+                message = f"DINOv2 ViT-B/14 加载失败，请检查网络或 ~/.cache/torch/hub 缓存: {error}"
+                raise RuntimeError(message) from error
         self.model = model.to(self.device).eval()
         self.transform = transforms.Compose(
             [
@@ -170,20 +165,18 @@ class DinoV2FeatureExtractor:
         if not isinstance(features, torch.Tensor) or features.ndim != 2:
             raise RuntimeError("DINOv2 未返回二维 x_norm_clstoken 特征")
         if features.shape[1] != self.feature_dimension:
-            raise RuntimeError(
-                f"DINOv2 特征维度异常: 期望 {self.feature_dimension}, 实际 {features.shape[1]}"
-            )
+            raise RuntimeError(f"DINOv2 特征维度异常: 期望 {self.feature_dimension}, 实际 {features.shape[1]}")
         return F.normalize(features.float(), dim=1).cpu()
 
 
 def compare_matched_parts(
-    matched: Sequence[Tuple[str, Detection, Detection]],
+    matched: Sequence[tuple[str, Detection, Detection]],
     reference_image: Image.Image,
     actual_image: Image.Image,
     feature_extractor: Any,
     similar_threshold: float,
     review_threshold: float,
-) -> List[MatchedPart]:
+) -> list[MatchedPart]:
     """裁剪公共部件并按固定顺序批量提取、比较双方特征。"""
     if not matched:
         return []
@@ -221,7 +214,7 @@ def compare_matched_parts(
     return compared
 
 
-def _detection_payload(detection: Detection) -> Dict[str, Any]:
+def _detection_payload(detection: Detection) -> dict[str, Any]:
     """把检测对象转换为可直接写入 JSON 的字段。"""
     return {
         "class_id": detection.class_id,
@@ -241,7 +234,7 @@ def build_report(
     matched_parts: Sequence[MatchedPart],
     reference_only: Sequence[Detection],
     actual_only: Sequence[Detection],
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """构建包含复现实验信息和全部比对证据的结构化报告。"""
     if any(part.verdict == "inconsistent" for part in matched_parts):
         verdict, verdict_text = "inconsistent", "存在部件外观不一致"
@@ -265,12 +258,8 @@ def build_report(
             }
         )
 
-    unmatched_payload = [
-        {**_detection_payload(detection), "side": "reference_only"} for detection in reference_only
-    ]
-    unmatched_payload.extend(
-        {**_detection_payload(detection), "side": "actual_only"} for detection in actual_only
-    )
+    unmatched_payload = [{**_detection_payload(detection), "side": "reference_only"} for detection in reference_only]
+    unmatched_payload.extend({**_detection_payload(detection), "side": "actual_only"} for detection in actual_only)
     return {
         "reference_image": str(reference_path.resolve()),
         "actual_image": str(actual_path.resolve()),
@@ -288,9 +277,7 @@ def build_report(
     }
 
 
-def resolve_inputs(
-    order_dir: Optional[Path], reference_path: Optional[Path], actual_path: Optional[Path]
-) -> Tuple[Path, Path]:
+def resolve_inputs(order_dir: Path | None, reference_path: Path | None, actual_path: Path | None) -> tuple[Path, Path]:
     """解析订单或显式图片输入，两个输入模式必须二选一。"""
     has_explicit_input = reference_path is not None or actual_path is not None
     if order_dir is not None and has_explicit_input:
@@ -310,9 +297,7 @@ def resolve_inputs(
     return reference_path, actual_path
 
 
-def validate_thresholds(
-    detection_threshold: float, similar_threshold: float, review_threshold: float
-) -> None:
+def validate_thresholds(detection_threshold: float, similar_threshold: float, review_threshold: float) -> None:
     """校验检测和相似度阈值范围及分档顺序。"""
     if not 0.0 <= detection_threshold <= 1.0:
         raise ValueError("检测置信度阈值必须在 0 到 1 之间")
@@ -322,7 +307,7 @@ def validate_thresholds(
         raise ValueError("一致阈值不能低于人工复核阈值")
 
 
-def save_report(report: Dict[str, Any], output_dir: Path) -> Path:
+def save_report(report: dict[str, Any], output_dir: Path) -> Path:
     """使用 UTF-8 保存结构化 JSON 报告。"""
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / "comparison.json"
@@ -343,7 +328,7 @@ def _load_font(size: int) -> ImageFont.ImageFont:
     return ImageFont.load_default()
 
 
-def _fit_panel(image: Image.Image, size: Tuple[int, int], background: str = "white") -> Image.Image:
+def _fit_panel(image: Image.Image, size: tuple[int, int], background: str = "white") -> Image.Image:
     """保持宽高比把图片居中放入固定尺寸面板。"""
     panel = Image.new("RGB", size, background)
     fitted = ImageOps.contain(image.convert("RGB"), size, Image.Resampling.LANCZOS)
@@ -351,17 +336,61 @@ def _fit_panel(image: Image.Image, size: Tuple[int, int], background: str = "whi
     return panel
 
 
+def place_label_box(
+    anchor_box: ClippedBox,
+    label_size: tuple[int, int],
+    canvas_size: tuple[int, int],
+    occupied: Sequence[ClippedBox],
+) -> ClippedBox:
+    """在检测框附近放置不越界且尽量不与其他标签重叠的文本框。"""
+    canvas_width, canvas_height = canvas_size
+    label_width = min(label_size[0], canvas_width)
+    label_height = min(label_size[1], canvas_height)
+    x1 = max(0, min(anchor_box[0], canvas_width - label_width))
+
+    def build_box(y1: int) -> ClippedBox:
+        y1 = max(0, min(y1, canvas_height - label_height))
+        return x1, y1, x1 + label_width, y1 + label_height
+
+    def overlaps(candidate: ClippedBox) -> bool:
+        return any(
+            not (
+                candidate[2] <= existing[0]
+                or candidate[0] >= existing[2]
+                or candidate[3] <= existing[1]
+                or candidate[1] >= existing[3]
+            )
+            for existing in occupied
+        )
+
+    candidates = (
+        build_box(anchor_box[1] - label_height - 2),
+        build_box(anchor_box[1]),
+        build_box(anchor_box[3] + 2),
+    )
+    for candidate in candidates:
+        if not overlaps(candidate):
+            return candidate
+
+    for y1 in range(0, canvas_height - label_height + 1, label_height + 2):
+        candidate = build_box(y1)
+        if not overlaps(candidate):
+            return candidate
+    return build_box(anchor_box[1])
+
+
 def _annotate_detections(
     image: Image.Image,
-    detections: Dict[str, Detection],
-    matched_parts: Dict[str, MatchedPart],
+    detections: dict[str, Detection],
+    matched_parts: dict[str, MatchedPart],
 ) -> Image.Image:
     """在原图坐标系绘制检测框和本次实际相似度。"""
     annotated = image.convert("RGB").copy()
     draw = ImageDraw.Draw(annotated)
     font = _load_font(max(16, min(32, annotated.width // 45)))
     line_width = max(2, annotated.width // 400)
-    for part_name, detection in detections.items():
+    occupied: list[ClippedBox] = []
+    for part_name, detection in sorted(detections.items(), key=lambda item: (item[1].box[1], item[1].box[0])):
         matched_part = matched_parts.get(part_name)
         color = VERDICT_COLORS.get(matched_part.verdict, (80, 140, 210)) if matched_part else (110, 110, 110)
         box = clip_box(detection.box, annotated.width, annotated.height)
@@ -369,22 +398,23 @@ def _annotate_detections(
         label = f"{part_name} conf={detection.confidence:.2f}"
         if matched_part:
             label += f" sim={matched_part.similarity:.3f}"
-        text_box = draw.textbbox((box[0], box[1]), label, font=font)
-        label_y = max(0, box[1] - (text_box[3] - text_box[1]) - 6)
-        label_box = (box[0], label_y, min(annotated.width, text_box[2] + 6), box[1])
+        text_box = draw.textbbox((0, 0), label, font=font)
+        label_size = (text_box[2] - text_box[0] + 6, text_box[3] - text_box[1] + 6)
+        label_box = place_label_box(box, label_size, annotated.size, occupied)
         draw.rectangle(label_box, fill=color)
-        draw.text((box[0] + 3, label_y + 1), label, fill="white", font=font)
+        draw.text((label_box[0] + 3, label_box[1] + 2), label, fill="white", font=font)
+        occupied.append(label_box)
     return annotated
 
 
 def save_visualizations(
     reference_image: Image.Image,
     actual_image: Image.Image,
-    reference_detections: Dict[str, Detection],
-    actual_detections: Dict[str, Detection],
+    reference_detections: dict[str, Detection],
+    actual_detections: dict[str, Detection],
     matched_parts: Sequence[MatchedPart],
     output_dir: Path,
-) -> Dict[str, str]:
+) -> dict[str, str]:
     """保存公共部件裁剪、逐部件对照图和双图检测汇总。"""
     output_dir.mkdir(parents=True, exist_ok=True)
     matched_by_name = {part.part_name: part for part in matched_parts}
@@ -424,7 +454,7 @@ def save_visualizations(
     }
 
 
-def _print_report(report: Dict[str, Any], report_path: Path) -> None:
+def _print_report(report: dict[str, Any], report_path: Path) -> None:
     """把最常用结果输出为便于实验核对的中文表格。"""
     print("\n===== 部件外观特征比对结果 =====")
     print(f"{'部件':<20} {'备案置信度':>10} {'实拍置信度':>10} {'相似度':>10}  判定")
@@ -453,8 +483,8 @@ def run_comparison(
     review_threshold: float = 0.60,
     device: str = "cpu",
     image_size: int = 640,
-    detector_model: Optional[Any] = None,
-    feature_extractor: Optional[Any] = None,
+    detector_model: Any | None = None,
+    feature_extractor: Any | None = None,
 ) -> Path:
     """执行单对图片检测、部件特征比对并保存全部实验结果。"""
     validate_thresholds(detection_threshold, similar_threshold, review_threshold)
@@ -527,7 +557,7 @@ def run_comparison(
     return report_path
 
 
-def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """解析单订单部件特征比对命令行参数。"""
     parser = argparse.ArgumentParser(description="电动自行车备案图与实拍图部件外观特征比对 Demo")
     parser.add_argument("--order-dir", type=Path, help="订单目录，读取 reference_3c.jpg 和 actual_left_front_45.jpg")
@@ -554,7 +584,7 @@ def _resolve_device(device: str) -> str:
     return "cpu"
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     """运行命令行 Demo，并把可操作错误转换为非零退出码。"""
     args = parse_args(argv)
     order_dir = args.order_dir
@@ -565,7 +595,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         reference_path, actual_path = resolve_inputs(order_dir, args.reference, args.actual)
         device = _resolve_device(args.device)
         order_name = order_dir.name if order_dir is not None else reference_path.stem
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now(timezone.utc).astimezone().strftime("%Y%m%d_%H%M%S")
         output_dir = args.output_dir or SCRIPT_DIR / "runs" / order_name / timestamp
         run_comparison(
             reference_path=reference_path,

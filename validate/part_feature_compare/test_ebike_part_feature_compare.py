@@ -4,6 +4,7 @@ import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 import torch
@@ -11,7 +12,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from ebike_part_feature_compare import (  # noqa: E402
+from ebike_part_feature_compare import (
     Detection,
     DinoV2FeatureExtractor,
     build_report,
@@ -20,8 +21,9 @@ from ebike_part_feature_compare import (  # noqa: E402
     compare_matched_parts,
     cosine_similarity,
     crop_detection,
-    parse_yolo_result,
     pair_detections,
+    parse_yolo_result,
+    place_label_box,
     resolve_inputs,
     run_comparison,
     save_report,
@@ -137,6 +139,18 @@ def test_dinov2_extractor_returns_normalized_768d_features():
     assert torch.linalg.vector_norm(features, dim=1).tolist() == pytest.approx([1.0, 1.0])
 
 
+def test_dinov2_load_error_preserves_upstream_reason(monkeypatch):
+    """防止网络或缓存异常被包装成无法继续排查的笼统错误。"""
+
+    def fail_to_load(*args, **kwargs):
+        raise OSError("download timed out")
+
+    monkeypatch.setattr(torch.hub, "load", fail_to_load)
+
+    with pytest.raises(RuntimeError, match="download timed out"):
+        DinoV2FeatureExtractor(device="cpu")
+
+
 def test_build_report_records_models_thresholds_and_unmatched_parts():
     """防止报告漏掉复现实验所需的模型、阈值或单侧检测证据。"""
     report = build_report(
@@ -221,7 +235,7 @@ def test_save_report_writes_utf8_json(tmp_path):
 class _FakeDetector:
     """替代外部 YOLO 推理，返回完整 Results 边界结构。"""
 
-    names = {0: "ebike_full", 5: "saddle", 7: "rear_box"}
+    names: ClassVar = {0: "ebike_full", 5: "saddle", 7: "rear_box"}
 
     def predict(self, **kwargs):
         reference = SimpleNamespace(
@@ -283,3 +297,19 @@ def test_run_comparison_writes_report_summary_and_part_evidence(tmp_path):
     assert (output_dir / "crops" / "saddle" / "reference.jpg").is_file()
     assert (output_dir / "crops" / "saddle" / "actual.jpg").is_file()
     assert (output_dir / "crops" / "saddle" / "comparison.jpg").is_file()
+
+
+def test_place_label_box_keeps_label_inside_canvas_and_avoids_collision():
+    """防止右侧部件标签被画布裁断或与已有标签重叠。"""
+    occupied = [(50, 0, 100, 16)]
+
+    label_box = place_label_box(
+        anchor_box=(90, 18, 100, 40),
+        label_size=(50, 16),
+        canvas_size=(100, 60),
+        occupied=occupied,
+    )
+
+    assert label_box == (50, 18, 100, 34)
+    assert label_box[0] >= 0 and label_box[2] <= 100
+    assert label_box[1] >= 0 and label_box[3] <= 60
