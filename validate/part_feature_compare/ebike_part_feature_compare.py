@@ -2,18 +2,34 @@
 
 """电动自行车备案图与实拍图的部件外观特征比对 Demo。"""
 
+import argparse
+import json
+import sys
 from dataclasses import dataclass
+from datetime import datetime
 from math import ceil, floor
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from torchvision import transforms
 
 Box = Tuple[float, float, float, float]
 ClippedBox = Tuple[int, int, int, int]
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_DETECTOR = Path(
+    "/Users/mark/Workspace/ultralytics/yunst_ai/validate_best_model/yolo11l_12000_best.pt"
+)
+DEFAULT_ORDER_DIR = Path(
+    "/Users/mark/Workspace/ultralytics/validate/orders/2071943118060388353_214522621506984"
+)
+VERDICT_COLORS = {
+    "consistent": (34, 139, 94),
+    "review": (222, 143, 0),
+    "inconsistent": (196, 55, 55),
+}
 
 
 @dataclass(frozen=True)
@@ -270,3 +286,303 @@ def build_report(
         "matched_parts": matched_payload,
         "unmatched_parts": unmatched_payload,
     }
+
+
+def resolve_inputs(
+    order_dir: Optional[Path], reference_path: Optional[Path], actual_path: Optional[Path]
+) -> Tuple[Path, Path]:
+    """解析订单或显式图片输入，两个输入模式必须二选一。"""
+    has_explicit_input = reference_path is not None or actual_path is not None
+    if order_dir is not None and has_explicit_input:
+        raise ValueError("--order-dir 与 --reference/--actual 必须二选一")
+    if order_dir is None and not has_explicit_input:
+        raise ValueError("必须使用 --order-dir，或同时提供 --reference 和 --actual")
+
+    if order_dir is not None:
+        reference_path = order_dir / "reference_3c.jpg"
+        actual_path = order_dir / "actual_left_front_45.jpg"
+    elif reference_path is None or actual_path is None:
+        raise ValueError("显式图片模式必须同时提供 --reference 和 --actual")
+
+    for path, description in ((reference_path, "备案图"), (actual_path, "实拍图")):
+        if not path.is_file():
+            raise FileNotFoundError(f"{description}不存在: {path}")
+    return reference_path, actual_path
+
+
+def validate_thresholds(
+    detection_threshold: float, similar_threshold: float, review_threshold: float
+) -> None:
+    """校验检测和相似度阈值范围及分档顺序。"""
+    if not 0.0 <= detection_threshold <= 1.0:
+        raise ValueError("检测置信度阈值必须在 0 到 1 之间")
+    if not 0.0 <= review_threshold <= 1.0 or not 0.0 <= similar_threshold <= 1.0:
+        raise ValueError("相似度阈值必须在 0 到 1 之间")
+    if similar_threshold < review_threshold:
+        raise ValueError("一致阈值不能低于人工复核阈值")
+
+
+def save_report(report: Dict[str, Any], output_dir: Path) -> Path:
+    """使用 UTF-8 保存结构化 JSON 报告。"""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "comparison.json"
+    output_path.write_text(json.dumps(report, ensure_ascii=False, indent=4) + "\n", encoding="utf-8")
+    return output_path
+
+
+def _load_font(size: int) -> ImageFont.ImageFont:
+    """优先加载可显示中文的系统字体，缺失时退回 Pillow 默认字体。"""
+    font_paths = (
+        Path("/System/Library/Fonts/PingFang.ttc"),
+        Path("/System/Library/Fonts/STHeiti Light.ttc"),
+        Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+    )
+    for font_path in font_paths:
+        if font_path.is_file():
+            return ImageFont.truetype(str(font_path), size=size)
+    return ImageFont.load_default()
+
+
+def _fit_panel(image: Image.Image, size: Tuple[int, int], background: str = "white") -> Image.Image:
+    """保持宽高比把图片居中放入固定尺寸面板。"""
+    panel = Image.new("RGB", size, background)
+    fitted = ImageOps.contain(image.convert("RGB"), size, Image.Resampling.LANCZOS)
+    panel.paste(fitted, ((size[0] - fitted.width) // 2, (size[1] - fitted.height) // 2))
+    return panel
+
+
+def _annotate_detections(
+    image: Image.Image,
+    detections: Dict[str, Detection],
+    matched_parts: Dict[str, MatchedPart],
+) -> Image.Image:
+    """在原图坐标系绘制检测框和本次实际相似度。"""
+    annotated = image.convert("RGB").copy()
+    draw = ImageDraw.Draw(annotated)
+    font = _load_font(max(16, min(32, annotated.width // 45)))
+    line_width = max(2, annotated.width // 400)
+    for part_name, detection in detections.items():
+        matched_part = matched_parts.get(part_name)
+        color = VERDICT_COLORS.get(matched_part.verdict, (80, 140, 210)) if matched_part else (110, 110, 110)
+        box = clip_box(detection.box, annotated.width, annotated.height)
+        draw.rectangle(box, outline=color, width=line_width)
+        label = f"{part_name} conf={detection.confidence:.2f}"
+        if matched_part:
+            label += f" sim={matched_part.similarity:.3f}"
+        text_box = draw.textbbox((box[0], box[1]), label, font=font)
+        label_y = max(0, box[1] - (text_box[3] - text_box[1]) - 6)
+        label_box = (box[0], label_y, min(annotated.width, text_box[2] + 6), box[1])
+        draw.rectangle(label_box, fill=color)
+        draw.text((box[0] + 3, label_y + 1), label, fill="white", font=font)
+    return annotated
+
+
+def save_visualizations(
+    reference_image: Image.Image,
+    actual_image: Image.Image,
+    reference_detections: Dict[str, Detection],
+    actual_detections: Dict[str, Detection],
+    matched_parts: Sequence[MatchedPart],
+    output_dir: Path,
+) -> Dict[str, str]:
+    """保存公共部件裁剪、逐部件对照图和双图检测汇总。"""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    matched_by_name = {part.part_name: part for part in matched_parts}
+    font = _load_font(24)
+    small_font = _load_font(20)
+
+    for part in matched_parts:
+        part_dir = output_dir / "crops" / part.part_name
+        part_dir.mkdir(parents=True, exist_ok=True)
+        part.reference_crop.save(part_dir / "reference.jpg", quality=95)
+        part.actual_crop.save(part_dir / "actual.jpg", quality=95)
+
+        canvas = Image.new("RGB", (1000, 500), "white")
+        draw = ImageDraw.Draw(canvas)
+        color = VERDICT_COLORS[part.verdict]
+        draw.text((20, 14), f"{part.part_name}  similarity={part.similarity:.4f}", fill=color, font=font)
+        draw.text((20, 48), part.verdict_text, fill=color, font=small_font)
+        canvas.paste(_fit_panel(part.reference_crop, (480, 390)), (10, 95))
+        canvas.paste(_fit_panel(part.actual_crop, (480, 390)), (510, 95))
+        draw.text((20, 98), f"Reference conf={part.reference_detection.confidence:.3f}", fill="black", font=small_font)
+        draw.text((520, 98), f"Actual conf={part.actual_detection.confidence:.3f}", fill="black", font=small_font)
+        canvas.save(part_dir / "comparison.jpg", quality=95)
+
+    reference_annotated = _annotate_detections(reference_image, reference_detections, matched_by_name)
+    actual_annotated = _annotate_detections(actual_image, actual_detections, matched_by_name)
+    summary = Image.new("RGB", (1620, 720), "white")
+    summary.paste(_fit_panel(reference_annotated, (790, 650)), (10, 60))
+    summary.paste(_fit_panel(actual_annotated, (790, 650)), (820, 60))
+    summary_draw = ImageDraw.Draw(summary)
+    summary_draw.text((20, 15), "Reference 3C", fill="black", font=font)
+    summary_draw.text((830, 15), "Actual left-front 45", fill="black", font=font)
+    summary_path = output_dir / "comparison_summary.jpg"
+    summary.save(summary_path, quality=95)
+    return {
+        "summary": str(summary_path.resolve()),
+        "crops_dir": str((output_dir / "crops").resolve()),
+    }
+
+
+def _print_report(report: Dict[str, Any], report_path: Path) -> None:
+    """把最常用结果输出为便于实验核对的中文表格。"""
+    print("\n===== 部件外观特征比对结果 =====")
+    print(f"{'部件':<20} {'备案置信度':>10} {'实拍置信度':>10} {'相似度':>10}  判定")
+    for part in report["matched_parts"]:
+        print(
+            f"{part['part']:<20} "
+            f"{part['reference_detection']['confidence']:>10.4f} "
+            f"{part['actual_detection']['confidence']:>10.4f} "
+            f"{part['similarity']:>10.4f}  {part['verdict_text']}"
+        )
+    if report["unmatched_parts"]:
+        names = ", ".join(f"{part['part']}({part['side']})" for part in report["unmatched_parts"])
+        print(f"未进入 Level 2: {names}")
+    print(f"综合结果: {report['verdict_text']}")
+    print(f"JSON 报告: {report_path}")
+    print(f"汇总图: {report['artifacts']['summary']}")
+
+
+def run_comparison(
+    reference_path: Path,
+    actual_path: Path,
+    detector_path: Path,
+    output_dir: Path,
+    detection_threshold: float = 0.60,
+    similar_threshold: float = 0.80,
+    review_threshold: float = 0.60,
+    device: str = "cpu",
+    image_size: int = 640,
+    detector_model: Optional[Any] = None,
+    feature_extractor: Optional[Any] = None,
+) -> Path:
+    """执行单对图片检测、部件特征比对并保存全部实验结果。"""
+    validate_thresholds(detection_threshold, similar_threshold, review_threshold)
+    for path, description in (
+        (reference_path, "备案图"),
+        (actual_path, "实拍图"),
+        (detector_path, "YOLO 权重"),
+    ):
+        if not path.is_file():
+            raise FileNotFoundError(f"{description}不存在: {path}")
+
+    try:
+        reference_image = Image.open(reference_path).convert("RGB")
+        actual_image = Image.open(actual_path).convert("RGB")
+    except Exception as error:
+        raise ValueError(f"图片无法解码: {error}") from error
+
+    if detector_model is None:
+        from ultralytics import YOLO
+
+        detector_model = YOLO(detector_path)
+    results = detector_model.predict(
+        source=[str(reference_path), str(actual_path)],
+        imgsz=image_size,
+        conf=detection_threshold,
+        device=device,
+        verbose=False,
+    )
+    if len(results) != 2:
+        raise RuntimeError(f"YOLO 推理结果数量异常: 期望 2, 实际 {len(results)}")
+
+    reference_detections = parse_yolo_result(results[0])
+    actual_detections = parse_yolo_result(results[1])
+    matched, reference_only, actual_only = pair_detections(reference_detections, actual_detections)
+
+    matched_parts = []
+    if matched:
+        if feature_extractor is None:
+            feature_extractor = DinoV2FeatureExtractor(device=device)
+        matched_parts = compare_matched_parts(
+            matched,
+            reference_image,
+            actual_image,
+            feature_extractor,
+            similar_threshold,
+            review_threshold,
+        )
+
+    report = build_report(
+        reference_path=reference_path,
+        actual_path=actual_path,
+        detector_path=detector_path,
+        detection_threshold=detection_threshold,
+        similar_threshold=similar_threshold,
+        review_threshold=review_threshold,
+        matched_parts=matched_parts,
+        reference_only=reference_only,
+        actual_only=actual_only,
+    )
+    report["artifacts"] = save_visualizations(
+        reference_image,
+        actual_image,
+        reference_detections,
+        actual_detections,
+        matched_parts,
+        output_dir,
+    )
+    report_path = save_report(report, output_dir)
+    _print_report(report, report_path)
+    return report_path
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    """解析单订单部件特征比对命令行参数。"""
+    parser = argparse.ArgumentParser(description="电动自行车备案图与实拍图部件外观特征比对 Demo")
+    parser.add_argument("--order-dir", type=Path, help="订单目录，读取 reference_3c.jpg 和 actual_left_front_45.jpg")
+    parser.add_argument("--reference", type=Path, help="显式指定 3C 合格证官方图")
+    parser.add_argument("--actual", type=Path, help="显式指定现场实拍图")
+    parser.add_argument("--detector", type=Path, default=DEFAULT_DETECTOR, help="YOLO 部件检测权重")
+    parser.add_argument("--det-conf", type=float, default=0.60, help="YOLO 检测置信度阈值，默认 0.60")
+    parser.add_argument("--similar-threshold", type=float, default=0.80, help="部件一致阈值，默认 0.80")
+    parser.add_argument("--review-threshold", type=float, default=0.60, help="人工复核阈值，默认 0.60")
+    parser.add_argument("--imgsz", type=int, default=640, help="YOLO 推理尺寸，默认 640")
+    parser.add_argument("--device", default="auto", help="推理设备：auto、cpu、mps 或 CUDA 设备编号")
+    parser.add_argument("--output-dir", type=Path, help="结果目录，默认按订单号和运行时间创建")
+    return parser.parse_args(argv)
+
+
+def _resolve_device(device: str) -> str:
+    """根据本机能力把 auto 解析为 YOLO 和 DINOv2 均支持的设备。"""
+    if device != "auto":
+        return device
+    if torch.cuda.is_available():
+        return "0"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """运行命令行 Demo，并把可操作错误转换为非零退出码。"""
+    args = parse_args(argv)
+    order_dir = args.order_dir
+    if order_dir is None and args.reference is None and args.actual is None:
+        order_dir = DEFAULT_ORDER_DIR
+
+    try:
+        reference_path, actual_path = resolve_inputs(order_dir, args.reference, args.actual)
+        device = _resolve_device(args.device)
+        order_name = order_dir.name if order_dir is not None else reference_path.stem
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = args.output_dir or SCRIPT_DIR / "runs" / order_name / timestamp
+        run_comparison(
+            reference_path=reference_path,
+            actual_path=actual_path,
+            detector_path=args.detector,
+            output_dir=output_dir,
+            detection_threshold=args.det_conf,
+            similar_threshold=args.similar_threshold,
+            review_threshold=args.review_threshold,
+            device=device,
+            image_size=args.imgsz,
+        )
+    except (FileNotFoundError, RuntimeError, ValueError) as error:
+        print(f"错误: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

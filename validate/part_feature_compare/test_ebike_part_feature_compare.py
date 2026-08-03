@@ -1,5 +1,6 @@
 # Ultralytics AGPL-3.0 License - https://ultralytics.com/license
 
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,7 +22,11 @@ from ebike_part_feature_compare import (  # noqa: E402
     crop_detection,
     parse_yolo_result,
     pair_detections,
+    resolve_inputs,
+    run_comparison,
+    save_report,
     select_best_detections,
+    validate_thresholds,
 )
 
 
@@ -178,3 +183,103 @@ def test_compare_matched_parts_uses_paired_crops_and_similarity_thresholds():
     assert compared[0].part_name == "saddle"
     assert compared[0].similarity == pytest.approx(0.0)
     assert compared[0].verdict == "inconsistent"
+
+
+def test_resolve_inputs_reads_fixed_order_filenames(tmp_path):
+    """防止订单模式读取到错误文件名或交换备案图和实拍图。"""
+    reference = tmp_path / "reference_3c.jpg"
+    actual = tmp_path / "actual_left_front_45.jpg"
+    reference.touch()
+    actual.touch()
+
+    resolved_reference, resolved_actual = resolve_inputs(tmp_path, None, None)
+
+    assert resolved_reference == reference
+    assert resolved_actual == actual
+
+
+def test_resolve_inputs_rejects_mixed_input_modes(tmp_path):
+    """防止订单模式和显式图片模式混用后产生不明确输入。"""
+    with pytest.raises(ValueError, match="二选一"):
+        resolve_inputs(tmp_path, Path("reference.jpg"), Path("actual.jpg"))
+
+
+def test_validate_thresholds_rejects_inverted_similarity_bands():
+    """防止一致阈值低于复核阈值导致分档分支不可达。"""
+    with pytest.raises(ValueError, match="一致阈值"):
+        validate_thresholds(0.6, similar_threshold=0.5, review_threshold=0.6)
+
+
+def test_save_report_writes_utf8_json(tmp_path):
+    """防止中文报告被 ASCII 转义或使用非 UTF-8 编码。"""
+    output = save_report({"verdict_text": "需人工复核"}, tmp_path)
+
+    assert json.loads(output.read_text(encoding="utf-8"))["verdict_text"] == "需人工复核"
+    assert "需人工复核" in output.read_text(encoding="utf-8")
+
+
+class _FakeDetector:
+    """替代外部 YOLO 推理，返回完整 Results 边界结构。"""
+
+    names = {0: "ebike_full", 5: "saddle", 7: "rear_box"}
+
+    def predict(self, **kwargs):
+        reference = SimpleNamespace(
+            boxes=SimpleNamespace(
+                cls=torch.tensor([0.0, 5.0]),
+                conf=torch.tensor([0.95, 0.90]),
+                xyxy=torch.tensor([[1, 1, 19, 19], [5, 5, 12, 12]], dtype=torch.float32),
+            ),
+            names=self.names,
+        )
+        actual = SimpleNamespace(
+            boxes=SimpleNamespace(
+                cls=torch.tensor([0.0, 5.0, 7.0]),
+                conf=torch.tensor([0.94, 0.85, 0.88]),
+                xyxy=torch.tensor([[2, 2, 20, 20], [6, 6, 13, 13], [12, 3, 19, 9]], dtype=torch.float32),
+            ),
+            names=self.names,
+        )
+        return [reference, actual]
+
+
+class _SamePairFeatureExtractor:
+    """为每一对裁剪返回相同方向的特征，预期全部判为一致。"""
+
+    def extract(self, images):
+        features = torch.zeros((len(images), 768))
+        features[:, 0] = 1.0
+        return features
+
+
+def test_run_comparison_writes_report_summary_and_part_evidence(tmp_path):
+    """防止完整流水线只打印分数而没有生成可回溯的文件证据。"""
+    reference_path = tmp_path / "reference_3c.jpg"
+    actual_path = tmp_path / "actual_left_front_45.jpg"
+    detector_path = tmp_path / "model.pt"
+    output_dir = tmp_path / "output"
+    Image.new("RGB", (24, 24), "white").save(reference_path)
+    Image.new("RGB", (24, 24), "gray").save(actual_path)
+    detector_path.touch()
+
+    report_path = run_comparison(
+        reference_path=reference_path,
+        actual_path=actual_path,
+        detector_path=detector_path,
+        output_dir=output_dir,
+        detection_threshold=0.6,
+        similar_threshold=0.8,
+        review_threshold=0.6,
+        device="cpu",
+        detector_model=_FakeDetector(),
+        feature_extractor=_SamePairFeatureExtractor(),
+    )
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["verdict"] == "consistent"
+    assert [part["part"] for part in report["matched_parts"]] == ["ebike_full", "saddle"]
+    assert report["unmatched_parts"][0]["part"] == "rear_box"
+    assert (output_dir / "comparison_summary.jpg").is_file()
+    assert (output_dir / "crops" / "saddle" / "reference.jpg").is_file()
+    assert (output_dir / "crops" / "saddle" / "actual.jpg").is_file()
+    assert (output_dir / "crops" / "saddle" / "comparison.jpg").is_file()
