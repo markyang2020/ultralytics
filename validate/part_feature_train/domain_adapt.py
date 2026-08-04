@@ -89,17 +89,21 @@ class ComponentPairDataset(Dataset):
             key = (s["vehicle_id"], s["component"])
             self.index.setdefault(key, []).append(s)
 
+        self.index = {
+            key: samples
+            for key, samples in self.index.items()
+            if {sample["domain"] for sample in samples} == {"reference", "actual"}
+        }
         self.keys = list(self.index.keys())
         print(f"[Dataset] {len(self.samples)} images, "
               f"{len(self.keys)} (vehicle, component) groups")
 
     def __len__(self):
-        # 每个epoch每个group生成若干对
-        return len(self.keys) * 8
+        return len(self.keys)
 
     def __getitem__(self, idx):
-        # 随机选一个 (vehicle, component) 组作为锚点
-        anchor_key = self.keys[idx % len(self.keys)]
+        # 每个 (vehicle, component) 组在一个 epoch 内只生成一个训练项。
+        anchor_key = self.keys[idx]
 
         # ── 正样本对 ──────────────────────────────────────
         # 从同一组里各取一张 reference 和 actual
@@ -107,16 +111,8 @@ class ComponentPairDataset(Dataset):
         refs    = [s for s in group if s["domain"] == "reference"]
         actuals = [s for s in group if s["domain"] == "actual"]
 
-        if not refs or not actuals:
-            # 这组数据不完整，fallback到自身对比（data augmentation作正样本）
-            sample = random.choice(group)
-            img_a = self._load(sample["path"])
-            img_p = self._augment_as_positive(img_a.copy())
-            label = 1
-        else:
-            img_a = self._load(random.choice(refs)["path"])
-            img_p = self._load(random.choice(actuals)["path"])
-            label = 1
+        img_a = self._load(random.choice(refs)["path"])
+        img_p = self._load(random.choice(actuals)["path"])
 
         # ── 负样本 ────────────────────────────────────────
         # 策略：70% 跨车型同部件（难负样本），30% 不同部件（易负样本）
@@ -158,18 +154,6 @@ class ComponentPairDataset(Dataset):
 
     def _load(self, path: str) -> Image.Image:
         return Image.open(path).convert("RGB")
-
-    def _augment_as_positive(self, img: Image.Image) -> Image.Image:
-        """当一组数据只有单域时，用数据增强生成正样本"""
-        aug = transforms.Compose([
-            transforms.RandomHorizontalFlip(p=0.3),
-            transforms.RandomRotation(degrees=15),
-            transforms.ColorJitter(brightness=0.4, contrast=0.4,
-                                   saturation=0.2, hue=0.05),
-            transforms.RandomGrayscale(p=0.3),
-            transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5)),
-        ])
-        return aug(img)
 
     # 图像预处理
     _transform_fn = transforms.Compose([

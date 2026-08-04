@@ -14,6 +14,7 @@ import os
 import cv2
 import json
 import shutil
+import hashlib
 from pathlib import Path
 from ultralytics import YOLO
 
@@ -28,6 +29,33 @@ TARGET_COMPONENT_NAMES = (
     "rack",
     "backrest",
 )
+CONF_THRESHOLD = 0.50
+
+
+def calculate_sha256(file_path: Path) -> str:
+    """计算构建输入文件的 SHA-256，保证训练数据可追溯。"""
+    digest = hashlib.sha256()
+    with file_path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_build_manifest(
+    output_root: Path, yolo_model_path: Path, inspection_records_path: Path, min_components: int, stats: dict
+):
+    """保存训练对构建时使用的不可变输入、参数和结果统计。"""
+    manifest = {
+        "yolo_model_path": str(yolo_model_path.resolve()),
+        "yolo_model_sha256": calculate_sha256(yolo_model_path),
+        "inspection_records_json": str(inspection_records_path.resolve()),
+        "inspection_records_sha256": calculate_sha256(inspection_records_path),
+        "conf_threshold": CONF_THRESHOLD,
+        "min_components": min_components,
+        "stats": stats,
+    }
+    with (output_root / "build_manifest.json").open("w") as file:
+        json.dump(manifest, file, indent=2, ensure_ascii=False)
 
 
 def crop_components_from_image(
@@ -107,11 +135,14 @@ def build_training_pairs(
       ...
     ]
     """
-    with open(inspection_records_json) as f:
+    inspection_records_path = Path(inspection_records_json)
+    yolo_model_path = Path(yolo_model_path)
+    with inspection_records_path.open() as f:
         records = json.load(f)
 
     yolo = YOLO(yolo_model_path)
     output_root = Path(output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
 
     stats = {"total": 0, "ok": 0, "skipped": 0}
 
@@ -127,7 +158,7 @@ def build_training_pairs(
 
         # 1. 处理合格证图
         ref_saved = crop_components_from_image(
-            rec["cert_image"], yolo, str(ref_dir)
+            rec["cert_image"], yolo, str(ref_dir), conf_threshold=CONF_THRESHOLD
         )
         if len(ref_saved) < min_components:
             print(f"  [SKIP] {vid}: only {len(ref_saved)} components in cert image")
@@ -138,7 +169,7 @@ def build_training_pairs(
         all_actual = {}
         for actual_path in rec.get("actual_images", []):
             saved = crop_components_from_image(
-                actual_path, yolo, str(actual_dir)
+                actual_path, yolo, str(actual_dir), conf_threshold=CONF_THRESHOLD
             )
             # 同一部件多张图：保留置信度最高的（覆盖写入，YOLO会选最优）
             all_actual.update(saved)
@@ -162,6 +193,7 @@ def build_training_pairs(
         stats["ok"] += 1
         print(f"  ✓ ref={list(ref_saved)}, actual={list(all_actual)}")
 
+    write_build_manifest(output_root, yolo_model_path, inspection_records_path, min_components, stats)
     print(f"\n[Done] total={stats['total']} ok={stats['ok']} "
           f"skipped={stats['skipped']}")
     print(f"Training pairs saved to: {output_root}/")
@@ -186,7 +218,7 @@ def verify_dataset(pairs_root: str):
                        if (vdir / "actual").exists() else set()
         common = ref_comps & actual_comps
 
-        if not common:
+        if len(common) < 2:
             continue
 
         total_vehicles += 1
