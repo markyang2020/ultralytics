@@ -1,0 +1,4 @@
+__pycache__/
+checkpoints/
+data_bbox*/
+detections_1400.json
